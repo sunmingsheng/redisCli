@@ -86,7 +86,7 @@ var restChan chan conn
 //key属性
 type KeyOption struct {
 	LifeTime time.Duration //过期时间
-	Mode string //添加模式
+	Mode     string        //添加模式
 }
 
 func init() {
@@ -210,7 +210,7 @@ func (c *client) Mset(kvs map[string]string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	cmd := []byte(fmt.Sprintf("*%d\r\n$4\r\nMSET\r\n", len(kvs) * 2 + 1))
+	cmd := []byte(fmt.Sprintf("*%d\r\n$4\r\nMSET\r\n", len(kvs)*2+1))
 	for key, value := range kvs {
 		cmd = append(cmd, []byte(fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(value), value))...)
 	}
@@ -227,7 +227,6 @@ func (c *client) Mset(kvs map[string]string) (bool, error) {
 		return false, ErrorAssertion
 	}
 }
-
 
 //del命令
 func (c *client) Del(keys ...string) (int, error) {
@@ -250,14 +249,13 @@ func (c *client) Del(keys ...string) (int, error) {
 	}
 }
 
-
 //expire命令
 func (c *client) Expire(key string, lifeTime time.Duration) (bool, error) {
 	conn, err := c.getConn()
 	if err != nil {
 		return false, err
 	}
-	seconds := strconv.FormatInt(int64(lifeTime.Seconds()),10)
+	seconds := strconv.FormatInt(int64(lifeTime.Seconds()), 10)
 	cmd := []byte(fmt.Sprintf("*3\r\n$6\r\nEXPIRE\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(seconds), seconds))
 	if resp, err := c.sendCmd(conn, cmd); err != nil {
 		return false, err
@@ -314,7 +312,6 @@ func (c *client) Exists(keys ...string) (int, error) {
 //func (c *client) Type(key string) (int, error) {
 //
 //}
-
 
 //发送命令
 func (c *client) sendCmd(conn conn, cmd []byte) (interface{}, error) {
@@ -431,10 +428,10 @@ func (c *client) parseResp(resp []byte) (interface{}, error) {
 	switch resp[0] {
 	case '-':
 		//错误类型
-		return nil, errors.New(string(resp[1:length-2]))
+		return nil, errors.New(string(resp[1 : length-2]))
 	case ':':
 		//整数回复
-		if num, err  := strconv.Atoi(string(resp[1:length-2])); err != nil {
+		if num, err := strconv.Atoi(string(resp[1 : length-2])); err != nil {
 			return nil, err
 		} else {
 			return num, nil
@@ -453,7 +450,7 @@ func (c *client) parseResp(resp []byte) (interface{}, error) {
 		s := strings.Split(string(resp), "\r\n")
 		res := []string{}
 		for i := 1; i < len(s); i++ {
-			if i % 2 == 1 && len(s[i]) > 0 && s[i][0] == '$'{
+			if i%2 == 1 && len(s[i]) > 0 && s[i][0] == '$' {
 				if (s[i][1:]) == "-1" {
 					res = append(res, "-1")
 				} else {
@@ -553,7 +550,7 @@ func (c *client) getConn() (conn, error) {
 			if netConn, err := createTcpConn(c.addr, c.connectTimeout); err != nil {
 				return conn{}, err
 			} else {
-				conn := conn{netConn:netConn}
+				conn := conn{netConn: netConn}
 				c.workPool.pool[conn] = struct{}{}
 				return conn, nil
 			}
