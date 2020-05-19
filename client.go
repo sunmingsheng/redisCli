@@ -100,7 +100,7 @@ var (
 )
 
 //空闲连接channel
-var resterChan chan conn
+var resterChan map[string]chan conn
 
 //key属性
 type KeyOption struct {
@@ -109,7 +109,8 @@ type KeyOption struct {
 }
 
 func init() {
-	resterChan = make(chan conn)
+	//a := make(map[string]chan conn)
+	resterChan = make(map[string]chan conn)  //根据addr的数量创建channel todo
 }
 
 //ping命令
@@ -429,7 +430,7 @@ func (c *client) deleteRestConn(conn conn) {
 //释放工作连接
 func (c *client) releaseWorkConn(conn conn) {
 	select {
-	case resterChan <- conn:
+	case resterChan[conn.addr] <- conn:
 
 	default:
 		c.deleteWorkConn(conn)
@@ -626,6 +627,7 @@ func NewClusterClient(option Option) (*client, error) {
 	for _, addr := range option.Cluster {
 		workerPool[addr] = make(map[conn]struct{})
 		resterPool[addr] = make(map[conn]resterConn)
+		resterChan[addr] = make(chan conn)
 	}
 
 	client := &client{
@@ -690,14 +692,9 @@ func (c *client) getConn(key string) (conn, error) {
 	}
 
 	select {
-	case conn := <-resterChan:
-		if conn.addr == addr {
-			return conn, nil
-		}
-		//资源回收
-		go c.releaseWorkConn(conn)
-		//获取新的连接
-		return c.getRestConn(addr)
+	case conn := <- resterChan[addr]:
+		fmt.Println("1212121212")
+		return conn, nil
 	default:
 		//获取新的连接
 		return c.getRestConn(addr)

@@ -20,7 +20,7 @@ func main() {
 			"127.0.0.1:7105",
 		},
 		MaxIdleTime: time.Second * 10,
-		MaxOpenConn: 50,
+		MaxOpenConn: 40,
 		MaxIdleConn: 2,
 	}
 	client, _ := redisCli.NewClusterClient(options)
