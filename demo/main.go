@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"redisCli"
@@ -12,35 +11,31 @@ func main() {
 
 	options := redisCli.Option{
 		Addr:"127.0.0.1:6379",
+		Cluster:[]string{
+			"127.0.0.1:7100",
+			"127.0.0.1:7101",
+			"127.0.0.1:7102",
+			"127.0.0.1:7103",
+			"127.0.0.1:7104",
+			"127.0.0.1:7105",
+		},
 		MaxIdleTime: time.Second * 10,
 		MaxOpenConn: 50,
 		MaxIdleConn: 2,
 	}
-	client, _ := redisCli.NewClient(options)
+	client, _ := redisCli.NewClusterClient(options)
 
-	//data := []byte("age")
-	//checksum := crc16.Checksum(data, crc16.SCSITable)
-	//fmt.Println(checksum)
-	//fmt.Println(checksum % 16384)
-
-	go func() {
-		for {
-			time.Sleep(5 * time.Second)
-			client.Status()
-		}
-	}()
-
-	//CRC16(key) %16384
+	num := 0
 	http.HandleFunc("/redis", func(writer http.ResponseWriter, request *http.Request) {
-		fmt.Println(client.Set("6666", "1212", &redisCli.KeyOption{
-			LifeTime: 1000 * time.Second,
-			Mode:     redisCli.SetNx,
-		}))
+
+		if _, err := client.Get("age"); err != nil && err.Error() == "无可用连接" {
+			num +=1
+		}
+		if _, err := client.Get("222"); err != nil && err.Error() == "无可用连接" {
+			num +=1
+		}
+		fmt.Println(num)
 	})
 	http.ListenAndServe(":8080", nil)
 }
 
-func test(ctx context.Context) {
-	time.Sleep(9 * time.Second)
-	fmt.Println(444)
-}
