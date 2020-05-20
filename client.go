@@ -12,18 +12,23 @@ import (
 )
 
 const (
-	defaultMaxOpenConn         = 3
-	defaultMaxIdleConn         = 1
-	defaultMaxIdleTime         = 5 * time.Minute
-	defaultConnectTimeout      = 3 * time.Second
-	defaultReadTimeout         = 2 * time.Second
-	defaultWriteTimeout        = 2 * time.Second
-	defaultHealthCheckDuration = 15 * time.Second
+	defaultMaxOpenConn         = 3 //默认单机最大连接数
+	defaultMaxIdleConn         = 1 //默认单机最大空闲连接数
+	defaultMaxIdleTime         = 5 * time.Minute //默认连接最大空闲时间
+	defaultConnectTimeout      = 3 * time.Second //默认连接超时时间
+	defaultReadTimeout         = 2 * time.Second //默认tcp读超时时间
+	defaultWriteTimeout        = 2 * time.Second //默认tcp写超时时间
+	defaultHealthCheckDuration = 15 * time.Second //默认健康检查周期
 )
 
 const (
-	singletonMode = "singleton"
-	clusterMode   = "cluster"
+	singletonMode = "singleton" //单机模式
+	clusterMode   = "cluster"   //cluster集群模式
+)
+
+const (
+	pingCmd = "*1\r\n$4\r\nPING\r\n" //ping命令
+	clusterNodeCmd = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n" //cluster nodes命令
 )
 
 const (
@@ -44,38 +49,40 @@ type Option struct {
 	HealthCheckDuration time.Duration //健康检查周期
 }
 
-type conn struct {
+type rConn struct {
 	netConn net.Conn
 	addr    string
 }
 
 //空闲连接对象
-type resterConn struct {
+type restedConn struct {
 	idleTime time.Time //空闲时间点
 }
 
 //空闲连接池
-type rester struct {
-	pool map[string]map[conn]resterConn
+type rested struct {
+	pool map[string]map[rConn]restedConn
 	lock sync.Mutex
 }
 
 //工作连接池
 type worker struct {
-	pool map[string]map[conn]struct{}
+	pool map[string]map[rConn]struct{}
 	lock sync.Mutex
 }
 
+//cluster节点hash槽
 type nodeSlot struct {
 	start int
 	end   int
 }
 
+//客户端
 type client struct {
 	addr                string              //连接地址
 	cluster             []string            //地址
 	worker              worker              //工作连接池
-	rester              rester              //空闲连接池
+	rested              rested              //空闲连接池
 	maxOpenConn         int                 //最大连接数
 	maxIdleConn         int                 //最大空闲数量
 	maxIdleTime         time.Duration       //最长空闲时间
@@ -100,7 +107,7 @@ var (
 )
 
 //空闲连接channel
-var resterChan map[string]chan conn
+var restedChan map[string]chan rConn
 
 //key属性
 type KeyOption struct {
@@ -109,17 +116,124 @@ type KeyOption struct {
 }
 
 func init() {
-	//a := make(map[string]chan conn)
-	resterChan = make(map[string]chan conn)  //根据addr的数量创建channel todo
+	restedChan = make(map[string]chan rConn)
+}
+
+//创建客户端
+func NewClient(option Option) (*client, error) {
+
+	//处理数据
+	warpOption(&option)
+
+	//初始化数据
+	workerPool := make(map[string]map[rConn]struct{})
+	workerPool[option.Addr] = make(map[rConn]struct{})
+	restedPool := make(map[string]map[rConn]restedConn)
+	restedPool[option.Addr] = make(map[rConn]restedConn)
+
+	//创建客户端对象
+	client := &client{
+		addr: option.Addr,
+		worker: worker{
+			pool: workerPool,
+			lock: sync.Mutex{},
+		},
+		rested: rested{
+			pool: restedPool,
+			lock: sync.Mutex{},
+		},
+		maxIdleConn:         option.MaxIdleConn,
+		maxOpenConn:         option.MaxOpenConn,
+		maxIdleTime:         option.MaxIdleTime,
+		connectTimeout:      option.ConnectTimeout,
+		readTimeout:         option.ReadTimeout,
+		writeTimeout:        option.WriteTimeout,
+		healthCheckDuration: option.HealthCheckDuration,
+		mode:                singletonMode,
+	}
+
+	//启动协程，监控所有的连接
+	go healthCheck(client)
+	return client, nil
+}
+
+//创建cluster客户端
+func NewClusterClient(option Option) (*client, error) {
+	//处理数据
+	warpOption(&option)
+
+	//初始化数据
+	workerPool := make(map[string]map[rConn]struct{})
+	restedPool := make(map[string]map[rConn]restedConn)
+	for _, addr := range option.Cluster {
+		workerPool[addr] = make(map[rConn]struct{})
+		restedPool[addr] = make(map[rConn]restedConn)
+		restedChan[addr] = make(chan rConn)
+	}
+
+	//创建客户端对象
+	client := &client{
+		cluster: option.Cluster,
+		worker: worker{
+			pool: workerPool,
+			lock: sync.Mutex{},
+		},
+		rested: rested{
+			pool: restedPool,
+			lock: sync.Mutex{},
+		},
+		maxIdleConn:         option.MaxIdleConn,
+		maxOpenConn:         option.MaxOpenConn,
+		maxIdleTime:         option.MaxIdleTime,
+		connectTimeout:      option.ConnectTimeout,
+		readTimeout:         option.ReadTimeout,
+		writeTimeout:        option.WriteTimeout,
+		healthCheckDuration: option.HealthCheckDuration,
+		mode:                clusterMode,
+		nodeSlots:           map[string]nodeSlot{},
+		lock:                sync.Mutex{},
+	}
+
+	//发送 cluster nodes命令获取集群状态数据
+	if conn, err := client.getConn(""); err != nil {
+		return nil, err
+	} else {
+		if err := client.getClusterNodes(conn); err != nil {
+			return nil, err
+		}
+	}
+
+	//启动协程，监控所有的连接
+	go healthCheck(client)
+	return client, nil
+}
+
+//查询状态
+func (c *client) Status() {
+	if c.mode == singletonMode {
+		fmt.Println("连接地址:" + c.addr)
+		fmt.Println("工作连接数:", len(c.worker.pool[c.addr]))
+		fmt.Println("空闲连接数:", len(c.rested.pool[c.addr]))
+	} 
+	if c.mode == clusterMode {
+		for _, addr := range c.cluster {
+			fmt.Println("连接地址:" + addr)
+			fmt.Println("工作连接数:", len(c.worker.pool[addr]))
+			fmt.Println("空闲连接数:", len(c.rested.pool[addr]))
+			fmt.Println(strings.Repeat("-", 50))
+		}
+	}
+	fmt.Println("当前时间:", time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Println(strings.Repeat("*", 50))
 }
 
 //ping命令
 func (c *client) Ping() (string, error) {
-	cmd := []byte("*1\r\n$4\r\nPING\r\n")
-	if resp, err := c.sendCmd("", cmd); err != nil {
+	cmd := []byte(pingCmd)
+	if res, err := c.sendCmd("", cmd); err != nil {
 		return "", err
 	} else {
-		if v, ok := resp.(string); ok {
+		if v, ok := res.(string); ok {
 			return v, nil
 		} else {
 			return "", ErrorAssertion
@@ -130,18 +244,18 @@ func (c *client) Ping() (string, error) {
 //get命令
 func (c *client) Get(key string) (string, error) {
 	cmd := []byte(fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return "", err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case string:
-			v := resp.(string)
+			v := res.(string)
 			if v == "-1" {
 				return "", ErrorKeyNotFound
 			}
 			return v, nil
 		case []string:
-			v := resp.([]string)
+			v := res.([]string)
 			return v[1], nil
 		}
 		return "", ErrorAssertion
@@ -168,12 +282,12 @@ func (c *client) Set(key string, val string, option *KeyOption) (bool, error) {
 		}
 		cmd = append([]byte(fmt.Sprintf("*%d", varNum)), cmd[2:]...)
 	}
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return false, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case string:
-			v := resp.(string)
+			v := res.(string)
 			if v == "OK" {
 				return true, nil
 			}
@@ -186,12 +300,12 @@ func (c *client) Set(key string, val string, option *KeyOption) (bool, error) {
 //del命令
 func (c *client) Del(key string) (int, error) {
 	cmd := []byte(fmt.Sprintf("*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return 0, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case int:
-			return resp.(int), nil
+			return res.(int), nil
 		}
 		return 0, ErrorAssertion
 	}
@@ -201,12 +315,12 @@ func (c *client) Del(key string) (int, error) {
 func (c *client) Expire(key string, lifeTime time.Duration) (bool, error) {
 	seconds := strconv.FormatInt(int64(lifeTime.Seconds()), 10)
 	cmd := []byte(fmt.Sprintf("*3\r\n$6\r\nEXPIRE\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(seconds), seconds))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return false, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case int:
-			if resp.(int) == 1 {
+			if res.(int) == 1 {
 				return true, nil
 			}
 			return false, nil
@@ -218,12 +332,12 @@ func (c *client) Expire(key string, lifeTime time.Duration) (bool, error) {
 //exists命令
 func (c *client) Exists(key string) (int, error) {
 	cmd := []byte(fmt.Sprintf("*%3\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return 0, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case int:
-			return resp.(int), nil
+			return res.(int), nil
 		}
 		return 0, ErrorAssertion
 	}
@@ -232,12 +346,12 @@ func (c *client) Exists(key string) (int, error) {
 //incr命令
 func (c *client) Incr(key string) (int, error) {
 	cmd := []byte(fmt.Sprintf("*2\r\n$4\r\nINCR\r\n$%d\r\n%s\r\n", len(key), key))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return 0, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case int:
-			return resp.(int), nil
+			return res.(int), nil
 		}
 		return 0, ErrorAssertion
 	}
@@ -246,12 +360,12 @@ func (c *client) Incr(key string) (int, error) {
 //decr命令
 func (c *client) Decr(key string) (int, error) {
 	cmd := []byte(fmt.Sprintf("*2\r\n$4\r\nDECR\r\n$%d\r\n%s\r\n", len(key), key))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return 0, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case int:
-			return resp.(int), nil
+			return res.(int), nil
 		}
 		return 0, ErrorAssertion
 	}
@@ -260,96 +374,104 @@ func (c *client) Decr(key string) (int, error) {
 //ttl命令
 func (c *client) TTL(key string) (int, error) {
 	cmd := []byte(fmt.Sprintf("*2\r\n$3\r\nTTL\r\n$%d\r\n%s\r\n", len(key), key))
-	if resp, err := c.sendCmd(key, cmd); err != nil {
+	if res, err := c.sendCmd(key, cmd); err != nil {
 		return 0, err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case int:
-			return resp.(int), nil
+			return res.(int), nil
 		}
 		return 0, ErrorAssertion
 	}
 }
 
-//hset命令
+//通过指定连接发送命令
+func (c *client) sendCmdByAssignConn(conn rConn, cmd []byte) (interface{}, error) {
 
-//hexists命令
+	//设置tcp读超时
+	if err := conn.netConn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+		go c.closeWorkConn(conn)
+		return nil, err
+	}
+
+	//设置tcp写超时
+	if err := conn.netConn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+		go c.closeWorkConn(conn)
+		return nil, err
+	}
+
+	//写入数据
+	if _, err := conn.netConn.Write(cmd); err != nil {
+		go c.closeWorkConn(conn)
+		return nil, err
+	}
+
+	//读取数据
+	data := []byte{}
+	for {
+		size := 1024
+		temp := make([]byte, size)
+		length, err := conn.netConn.Read(temp)
+		if err != nil {
+			go c.closeWorkConn(conn)
+			return nil, err
+		}
+		if length < size {
+			data = append(data, temp[0:length]...)
+			if string(data[len(data)-2:]) == "\r\n" {
+				break
+			}
+		} else {
+			data = append(data, temp...)
+		}
+	}
+	//释放工作连接
+	go c.releaseWorkConn(conn)
+
+	//解析数据
+	if v, err := c.parseResp(data); err != nil {
+		if err == ErrorMoved || err == ErrorAsk {
+			if err := c.getClusterNodes(conn); err != nil {
+				return nil, err
+			}
+		}
+		return nil, err
+	} else {
+		return v, nil
+	}
+}
 
 //发送命令
 func (c *client) sendCmd(key string, cmd []byte) (interface{}, error) {
 
 	//设置最大尝试次数
-	for i := 0; i < 2; i ++ {
+	for i := 0; i < 2; i++ {
 		//获取连接
 		conn, err := c.getConn(key)
 		if err != nil {
 			return nil, err
 		}
 
-		//设置tcp读超时
-		if err := conn.netConn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
-			go c.closeWorkConn(conn)
-			return nil, err
-		}
-
-		//设置tcp写超时
-		if err := conn.netConn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
-			go c.closeWorkConn(conn)
-			return nil, err
-		}
-
-		//写入数据
-		if _, err := conn.netConn.Write(cmd); err != nil {
-			go c.closeWorkConn(conn)
-			return nil, err
-		}
-
-		//读取数据
-		data := []byte{}
-		for {
-			size := 1024
-			temp := make([]byte, size)
-			length, err := conn.netConn.Read(temp)
-			if err != nil {
-				go c.closeWorkConn(conn)
-				return nil, err
-			}
-			if length < size {
-				data = append(data, temp[0:length]...)
-				if string(data[len(data)-2:]) == "\r\n" {
-					break
-				}
-			} else {
-				data = append(data, temp...)
-			}
-		}
-		//释放工作连接
-		go c.releaseWorkConn(conn)
-
-		//解析数据
-		if v, err := c.parseResp(data); err != nil {
+		if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
 			if err == ErrorMoved || err == ErrorAsk {
-				if err := c.getClusterNodes(conn); err != nil {
-					return nil, err
-				}
 				continue
 			}
 			return nil, err
 		} else {
-			return v, nil
+			return res, nil
 		}
 	}
 	return nil, ErrorSomeWrong
 }
 
 //关闭工作连接
-func (c *client) closeWorkConn(conn conn) {
+func (c *client) closeWorkConn(conn rConn) {
 	c.deleteWorkConn(conn)
 	conn.netConn.Close()
 }
 
 //删除工作连接
-func (c *client) deleteWorkConn(conn conn) {
+func (c *client) deleteWorkConn(conn rConn) {
 	c.worker.lock.Lock()
 	for addr, conns := range c.worker.pool {
 		for key, _ := range conns {
@@ -363,64 +485,64 @@ func (c *client) deleteWorkConn(conn conn) {
 }
 
 //获取空闲连接
-func (c *client) getRestConn(addr string) (conn, error) {
-	c.rester.lock.Lock()
-	defer c.rester.lock.Unlock()
-	if _, ok := c.rester.pool[addr]; ok && len(c.rester.pool[addr]) > 0 {
-		var resterConn conn
-		for key := range c.rester.pool[addr] {
-			resterConn = key
+func (c *client) getRestConn(addr string) (rConn, error) {
+	c.rested.lock.Lock()
+	defer c.rested.lock.Unlock()
+	if _, ok := c.rested.pool[addr]; ok && len(c.rested.pool[addr]) > 0 {
+		var restedConn rConn
+		for key := range c.rested.pool[addr] {
+			restedConn = key
 			break
 		}
 		if len(c.worker.pool[addr]) < c.maxOpenConn {
 			c.worker.lock.Lock()
-			c.worker.pool[resterConn.addr][resterConn] = struct{}{}
+			c.worker.pool[restedConn.addr][restedConn] = struct{}{}
 			c.worker.lock.Unlock()
-			c.deleteRestConn(resterConn)
-			return resterConn, nil
+			c.deleteRestConn(restedConn)
+			return restedConn, nil
 		} else {
-			c.deleteRestConn(resterConn)
-			return conn{}, ErrorNoConnect
+			c.deleteRestConn(restedConn)
+			return rConn{}, ErrorNoConnect
 		}
 	}
 
 	//检查是否超出最大连接数
 	if len(c.worker.pool[addr]) < c.maxOpenConn {
 		if netConn, err := createTcpConn(addr, c.connectTimeout); err != nil {
-			return conn{}, err
+			return rConn{}, err
 		} else {
 			c.worker.lock.Lock()
-			newConn := conn{netConn: netConn, addr: addr}
+			newConn := rConn{netConn: netConn, addr: addr}
 			if _, ok := c.worker.pool[addr]; !ok {
-				c.worker.pool[newConn.addr] = make(map[conn]struct{})
+				c.worker.pool[newConn.addr] = make(map[rConn]struct{})
 			}
 			c.worker.pool[addr][newConn] = struct{}{}
 			c.worker.lock.Unlock()
 			return newConn, nil
 		}
 	}
-	return conn{}, ErrorNoConnect
+	return rConn{}, ErrorNoConnect
 }
 
 //添加空闲连接
-func (c *client) addRestConn(conn conn) {
-	c.rester.lock.Lock()
-	c.rester.pool[conn.addr][conn] = resterConn{idleTime: time.Now()}
-	c.rester.lock.Unlock()
+func (c *client) addRestConn(conn rConn) {
+	c.rested.lock.Lock()
+	c.rested.pool[conn.addr][conn] = restedConn{idleTime: time.Now()}
+	c.rested.lock.Unlock()
 }
 
 //关闭空闲连接
-func (c *client) closeRestConn(conn conn) {
+func (c *client) closeRestConn(conn rConn) {
 	c.deleteRestConn(conn)
 	conn.netConn.Close()
 }
 
 //删除空闲连接
-func (c *client) deleteRestConn(conn conn) {
-	for addr, conns := range c.rester.pool {
+func (c *client) deleteRestConn(conn rConn) {
+	for addr, conns := range c.rested.pool {
 		for key, _ := range conns {
 			if key == conn {
-				delete(c.rester.pool[addr], key)
+				delete(c.rested.pool[addr], key)
 				break
 			}
 		}
@@ -428,11 +550,11 @@ func (c *client) deleteRestConn(conn conn) {
 }
 
 //释放工作连接
-func (c *client) releaseWorkConn(conn conn) {
+func (c *client) releaseWorkConn(conn rConn) {
 	select {
-	case resterChan[conn.addr] <- conn:
+	case restedChan[conn.addr] <- conn:
 
-	default:
+	case <-time.After(5 * time.Second):
 		c.deleteWorkConn(conn)
 		c.addRestConn(conn)
 	}
@@ -440,25 +562,30 @@ func (c *client) releaseWorkConn(conn conn) {
 
 //心跳检查(资源回收)
 func healthCheck(c *client) {
-	//todo 定时获取cluster nodes
-
-	cmd := []byte("*1\r\n$4\r\nPING\r\n")
+	cmd := []byte(pingCmd)
 	for {
-		time.Sleep(15 * time.Second)
-		for _, conns := range c.rester.pool {
-			resterConnNum := len(conns)
-			for conn, connStatus := range conns {
-				if connStatus.idleTime.Add(c.maxIdleTime).Before(time.Now()) && resterConnNum > c.maxIdleConn {
+		time.Sleep(c.healthCheckDuration)
+		if c.mode == clusterMode {
+			if conn, err := c.getConn(""); err != nil {
+				//todo 记录日志
+			} else {
+				c.getClusterNodes(conn)
+			}
+		}
+		for _, pool := range c.rested.pool {
+			connCount := len(pool)
+			for conn, connStatus := range pool {
+				if connStatus.idleTime.Add(c.maxIdleTime).Before(time.Now()) && connCount > c.maxIdleConn {
 					c.closeRestConn(conn)
 				}
-				if resp, err := c.sendCmd("", cmd); err != nil {
-					resterConnNum -= 1
+				if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
+					connCount -= 1
 					c.closeRestConn(conn)
 				} else {
-					if v, ok := resp.(string); ok && v == "PONG" {
+					if v, ok := res.(string); ok && v == "PONG" {
 						continue
 					} else {
-						resterConnNum -= 1
+						connCount -= 1
 						c.closeRestConn(conn)
 					}
 				}
@@ -468,14 +595,14 @@ func healthCheck(c *client) {
 }
 
 //发送cluster nodes命令
-func (c *client) getClusterNodes(conn conn) error {
-	cmd := []byte("*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n")
-	if resp, err := c.sendCmd("", cmd); err != nil {
+func (c *client) getClusterNodes(conn rConn) error {
+	cmd := []byte(clusterNodeCmd)
+	if res, err := c.sendCmd("", cmd); err != nil {
 		return err
 	} else {
-		switch resp.(type) {
+		switch res.(type) {
 		case []string:
-			nodes := resp.([]string)
+			nodes := res.([]string)
 			nodeSlots := make(map[string]nodeSlot)
 			for _, nodeInfo := range nodes {
 				info := strings.Split(nodeInfo, " ")
@@ -506,40 +633,40 @@ func (c *client) getClusterNodes(conn conn) error {
 }
 
 //解析redis-serve的响应
-func (c *client) parseResp(resp []byte) (interface{}, error) {
-	length := len(resp)
+func (c *client) parseResp(res []byte) (interface{}, error) {
+	length := len(res)
 	if length <= 1 {
 		return nil, ErrorRespEmpty
 	}
-	switch resp[0] {
+	switch res[0] {
 	case '-':
 		//错误类型
-		if string(resp[1:6]) == "MOVED" {
+		if string(res[1:6]) == "MOVED" {
 			return nil, ErrorMoved
 		}
-		if string(resp[1:4]) == "ASK" {
+		if string(res[1:4]) == "ASK" {
 			return nil, ErrorAsk
 		}
-		return nil, errors.New(string(resp[1 : length-2]))
+		return nil, errors.New(string(res[1 : length-2]))
 	case ':':
 		//整数回复
-		if num, err := strconv.Atoi(string(resp[1 : length-2])); err != nil {
+		if num, err := strconv.Atoi(string(res[1 : length-2])); err != nil {
 			return nil, err
 		} else {
 			return num, nil
 		}
 	case '+':
 		//响应为普通字符串
-		return string(resp[1 : length-2]), nil
+		return string(res[1 : length-2]), nil
 	case '$':
 		//批量回复
-		if resp[1] == '-' {
-			return string(resp[1 : length-2]), nil
+		if res[1] == '-' {
+			return string(res[1 : length-2]), nil
 		}
-		return strings.Split(string(resp[1:length-2]), "\n"), nil
+		return strings.Split(string(res[1:length-2]), "\n"), nil
 	case '*':
 		//数组
-		s := strings.Split(string(resp), "\r\n")
+		s := strings.Split(string(res), "\r\n")
 		res := []string{}
 		for i := 1; i < len(s); i++ {
 			if i%2 == 1 && len(s[i]) > 0 && s[i][0] == '$' {
@@ -580,91 +707,6 @@ func warpOption(option *Option) {
 	}
 }
 
-//创建客户端
-func NewClient(option Option) (*client, error) {
-
-	//处理数据
-	warpOption(&option)
-	workerPool := make(map[string]map[conn]struct{})
-	workerPool[option.Addr] = make(map[conn]struct{})
-	resterPool := make(map[string]map[conn]resterConn)
-	resterPool[option.Addr] = make(map[conn]resterConn)
-
-	client := &client{
-		addr: option.Addr,
-		worker: worker{
-			pool: workerPool,
-			lock: sync.Mutex{},
-		},
-		rester: rester{
-			pool: resterPool,
-			lock: sync.Mutex{},
-		},
-		maxIdleConn:         option.MaxIdleConn,
-		maxOpenConn:         option.MaxOpenConn,
-		maxIdleTime:         option.MaxIdleTime,
-		connectTimeout:      option.ConnectTimeout,
-		readTimeout:         option.ReadTimeout,
-		writeTimeout:        option.WriteTimeout,
-		healthCheckDuration: option.HealthCheckDuration,
-		mode:                singletonMode,
-	}
-
-	//启动协程，监控所有的连接
-	go healthCheck(client)
-
-	return client, nil
-}
-
-//创建cluster客户端
-func NewClusterClient(option Option) (*client, error) {
-	//处理数据
-	warpOption(&option)
-
-	workerPool := make(map[string]map[conn]struct{})
-	resterPool := make(map[string]map[conn]resterConn)
-
-	for _, addr := range option.Cluster {
-		workerPool[addr] = make(map[conn]struct{})
-		resterPool[addr] = make(map[conn]resterConn)
-		resterChan[addr] = make(chan conn)
-	}
-
-	client := &client{
-		cluster: option.Cluster,
-		worker: worker{
-			pool: workerPool,
-			lock: sync.Mutex{},
-		},
-		rester: rester{
-			pool: resterPool,
-			lock: sync.Mutex{},
-		},
-		maxIdleConn:         option.MaxIdleConn,
-		maxOpenConn:         option.MaxOpenConn,
-		maxIdleTime:         option.MaxIdleTime,
-		connectTimeout:      option.ConnectTimeout,
-		readTimeout:         option.ReadTimeout,
-		writeTimeout:        option.WriteTimeout,
-		healthCheckDuration: option.HealthCheckDuration,
-		mode:                clusterMode,
-		nodeSlots:           map[string]nodeSlot{},
-		lock:                sync.Mutex{},
-	}
-
-	//发送 cluster nodes命令获取集群状态数据
-	if conn, err := client.getConn(""); err != nil {
-		return nil, err
-	} else {
-		if err := client.getClusterNodes(conn); err != nil {
-			return nil, err
-		}
-	}
-	//启动协程，监控所有的连接
-	//go healthCheck(client)
-
-	return client, nil
-}
 
 //创建tcp连接
 func createTcpConn(addr string, timeout time.Duration) (net.Conn, error) {
@@ -672,7 +714,7 @@ func createTcpConn(addr string, timeout time.Duration) (net.Conn, error) {
 }
 
 //获取tcp连接
-func (c *client) getConn(key string) (conn, error) {
+func (c *client) getConn(key string) (rConn, error) {
 	addr := ""
 	if c.mode == clusterMode {
 		if key != "" {
@@ -692,8 +734,7 @@ func (c *client) getConn(key string) (conn, error) {
 	}
 
 	select {
-	case conn := <- resterChan[addr]:
-		fmt.Println("1212121212")
+	case conn := <-restedChan[addr]:
 		return conn, nil
 	default:
 		//获取新的连接

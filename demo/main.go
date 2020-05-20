@@ -20,10 +20,17 @@ func main() {
 			"127.0.0.1:7105",
 		},
 		MaxIdleTime: time.Second * 10,
-		MaxOpenConn: 40,
+		MaxOpenConn: 30,
 		MaxIdleConn: 2,
 	}
 	client, _ := redisCli.NewClusterClient(options)
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			client.Status()
+		}
+	}()
 
 	num := 0
 	http.HandleFunc("/redis", func(writer http.ResponseWriter, request *http.Request) {
