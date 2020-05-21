@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/howeyc/crc16"
+	"math/rand"
 	"net"
 	"strconv"
 	"strings"
@@ -12,12 +13,12 @@ import (
 )
 
 const (
-	defaultMaxOpenConn         = 3 //默认单机最大连接数
-	defaultMaxIdleConn         = 1 //默认单机最大空闲连接数
-	defaultMaxIdleTime         = 5 * time.Minute //默认连接最大空闲时间
-	defaultConnectTimeout      = 3 * time.Second //默认连接超时时间
-	defaultReadTimeout         = 2 * time.Second //默认tcp读超时时间
-	defaultWriteTimeout        = 2 * time.Second //默认tcp写超时时间
+	defaultMaxOpenConn         = 3                //默认单机最大连接数
+	defaultMaxIdleConn         = 1                //默认单机最大空闲连接数
+	defaultMaxIdleTime         = 5 * time.Minute  //默认连接最大空闲时间
+	defaultConnectTimeout      = 3 * time.Second  //默认连接超时时间
+	defaultReadTimeout         = 2 * time.Second  //默认tcp读超时时间
+	defaultWriteTimeout        = 2 * time.Second  //默认tcp写超时时间
 	defaultHealthCheckDuration = 15 * time.Second //默认健康检查周期
 )
 
@@ -27,7 +28,7 @@ const (
 )
 
 const (
-	pingCmd = "*1\r\n$4\r\nPING\r\n" //ping命令
+	pingCmd        = "*1\r\n$4\r\nPING\r\n"                   //ping命令
 	clusterNodeCmd = "*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n" //cluster nodes命令
 )
 
@@ -214,7 +215,7 @@ func (c *client) Status() {
 		fmt.Println("连接地址:" + c.addr)
 		fmt.Println("工作连接数:", len(c.worker.pool[c.addr]))
 		fmt.Println("空闲连接数:", len(c.rested.pool[c.addr]))
-	} 
+	}
 	if c.mode == clusterMode {
 		for _, addr := range c.cluster {
 			fmt.Println("连接地址:" + addr)
@@ -425,6 +426,7 @@ func (c *client) sendCmdByAssignConn(conn rConn, cmd []byte) (interface{}, error
 			data = append(data, temp...)
 		}
 	}
+
 	//释放工作连接
 	go c.releaseWorkConn(conn)
 
@@ -473,14 +475,7 @@ func (c *client) closeWorkConn(conn rConn) {
 //删除工作连接
 func (c *client) deleteWorkConn(conn rConn) {
 	c.worker.lock.Lock()
-	for addr, conns := range c.worker.pool {
-		for key, _ := range conns {
-			if key == conn {
-				delete(c.worker.pool[addr], key)
-				break
-			}
-		}
-	}
+	delete(c.worker.pool[conn.addr], conn)
 	c.worker.lock.Unlock()
 }
 
@@ -488,36 +483,37 @@ func (c *client) deleteWorkConn(conn rConn) {
 func (c *client) getRestConn(addr string) (rConn, error) {
 	c.rested.lock.Lock()
 	defer c.rested.lock.Unlock()
-	if _, ok := c.rested.pool[addr]; ok && len(c.rested.pool[addr]) > 0 {
+	//fmt.Println("+++++++++++++++++++++++++++")
+	//fmt.Println(len(c.rested.pool[addr]), len(c.worker.pool[addr]), c.maxOpenConn)
+	//fmt.Println("+++++++++++++++++++++++++++")
+	if len(c.rested.pool[addr]) > 0 {
 		var restedConn rConn
-		for key := range c.rested.pool[addr] {
-			restedConn = key
+		for conn := range c.rested.pool[addr] {
+			restedConn = conn
 			break
 		}
-		if len(c.worker.pool[addr]) < c.maxOpenConn {
-			c.worker.lock.Lock()
-			c.worker.pool[restedConn.addr][restedConn] = struct{}{}
+		c.worker.lock.Lock()
+		if len(c.worker.pool[addr]) + len(c.rested.pool[addr]) <= c.maxOpenConn {
+			c.worker.pool[addr][restedConn] = struct{}{}
 			c.worker.lock.Unlock()
 			c.deleteRestConn(restedConn)
 			return restedConn, nil
 		} else {
-			c.deleteRestConn(restedConn)
+			c.worker.lock.Unlock()
+			c.closeRestConn(restedConn)
 			return rConn{}, ErrorNoConnect
 		}
 	}
 
 	//检查是否超出最大连接数
-	if len(c.worker.pool[addr]) < c.maxOpenConn {
+	c.worker.lock.Lock()
+	defer c.worker.lock.Unlock()
+	if len(c.worker.pool[addr]) + len(c.rested.pool[addr]) < c.maxOpenConn {
 		if netConn, err := createTcpConn(addr, c.connectTimeout); err != nil {
 			return rConn{}, err
 		} else {
-			c.worker.lock.Lock()
 			newConn := rConn{netConn: netConn, addr: addr}
-			if _, ok := c.worker.pool[addr]; !ok {
-				c.worker.pool[newConn.addr] = make(map[rConn]struct{})
-			}
 			c.worker.pool[addr][newConn] = struct{}{}
-			c.worker.lock.Unlock()
 			return newConn, nil
 		}
 	}
@@ -539,10 +535,10 @@ func (c *client) closeRestConn(conn rConn) {
 
 //删除空闲连接
 func (c *client) deleteRestConn(conn rConn) {
-	for addr, conns := range c.rested.pool {
-		for key, _ := range conns {
-			if key == conn {
-				delete(c.rested.pool[addr], key)
+	for addr, pool := range c.rested.pool {
+		for rConn := range pool {
+			if rConn == conn {
+				delete(c.rested.pool[addr], rConn)
 				break
 			}
 		}
@@ -554,7 +550,7 @@ func (c *client) releaseWorkConn(conn rConn) {
 	select {
 	case restedChan[conn.addr] <- conn:
 
-	case <-time.After(5 * time.Second):
+	default:
 		c.deleteWorkConn(conn)
 		c.addRestConn(conn)
 	}
@@ -567,26 +563,28 @@ func healthCheck(c *client) {
 		time.Sleep(c.healthCheckDuration)
 		if c.mode == clusterMode {
 			if conn, err := c.getConn(""); err != nil {
-				//todo 记录日志
+				fmt.Println(err)
 			} else {
 				c.getClusterNodes(conn)
 			}
 		}
+
 		for _, pool := range c.rested.pool {
 			connCount := len(pool)
-			for conn, connStatus := range pool {
-				if connStatus.idleTime.Add(c.maxIdleTime).Before(time.Now()) && connCount > c.maxIdleConn {
-					c.closeRestConn(conn)
+			for rConn, restedConn := range pool {
+				if restedConn.idleTime.Add(c.maxIdleTime).Before(time.Now()) || connCount > c.maxIdleConn {
+					c.closeRestConn(rConn)
+					continue
 				}
-				if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
+				if res, err := c.sendCmdByAssignConn(rConn, cmd); err != nil {
 					connCount -= 1
-					c.closeRestConn(conn)
+					c.closeRestConn(rConn)
 				} else {
 					if v, ok := res.(string); ok && v == "PONG" {
-						continue
+
 					} else {
 						connCount -= 1
-						c.closeRestConn(conn)
+						c.closeRestConn(rConn)
 					}
 				}
 			}
@@ -597,7 +595,7 @@ func healthCheck(c *client) {
 //发送cluster nodes命令
 func (c *client) getClusterNodes(conn rConn) error {
 	cmd := []byte(clusterNodeCmd)
-	if res, err := c.sendCmd("", cmd); err != nil {
+	if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
 		return err
 	} else {
 		switch res.(type) {
@@ -707,7 +705,6 @@ func warpOption(option *Option) {
 	}
 }
 
-
 //创建tcp连接
 func createTcpConn(addr string, timeout time.Duration) (net.Conn, error) {
 	return net.DialTimeout("tcp", addr, timeout)
@@ -717,7 +714,10 @@ func createTcpConn(addr string, timeout time.Duration) (net.Conn, error) {
 func (c *client) getConn(key string) (rConn, error) {
 	addr := ""
 	if c.mode == clusterMode {
-		if key != "" {
+		if key != "" || (key == "" && len(c.nodeSlots) > 0) {
+			if key == "" {
+				key = randStringRunes(10)
+			}
 			checksum := crc16.Checksum([]byte(key), crc16.CCITTFalseTable)
 			slotNum := int(checksum % 16384)
 			for nodeAddr, nodeSlot := range c.nodeSlots {
@@ -727,12 +727,11 @@ func (c *client) getConn(key string) (rConn, error) {
 				}
 			}
 		} else {
-			addr = c.cluster[0]
+			addr = c.cluster[rand.Intn(len(c.cluster))]
 		}
 	} else {
 		addr = c.addr
 	}
-
 	select {
 	case conn := <-restedChan[addr]:
 		return conn, nil
@@ -740,4 +739,14 @@ func (c *client) getConn(key string) (rConn, error) {
 		//获取新的连接
 		return c.getRestConn(addr)
 	}
+}
+
+//生成随机字符串
+func randStringRunes(n int) string {
+	letterRunes := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	runes := make([]rune, n)
+	for i := range runes {
+		runes[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(runes)
 }
