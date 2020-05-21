@@ -10,7 +10,7 @@ import (
 
 func main() {
 
-	port := 7100
+	port := 7200
 	confPath := "/usr/local/var/go/redisCli/demo/cluster-init/redis.conf"
 	file, err := os.Open(confPath)
 	if err != nil {
