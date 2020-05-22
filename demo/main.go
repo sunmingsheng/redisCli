@@ -23,21 +23,27 @@ func main() {
 		MaxOpenConn: 30,
 		MaxIdleConn: 2,
 	}
-	client, err := redisCli.NewClusterClient(options)
+	client, err := redisCli.NewClient(options)
 	if err != nil {
 		fmt.Println(err)
 	}
 
+	client.AddHook(func(cmd, res []byte, addr string) {
+		//fmt.Println(string(cmd))
+		//fmt.Println(string(res))
+		//fmt.Println(addr)
+	})
+
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
-			client.Status()
+			//client.Status()
 		}
 	}()
 
 	http.HandleFunc("/redis", func(writer http.ResponseWriter, request *http.Request) {
 
-		fmt.Println(client.Get("age"))
+		fmt.Println(client.HLen("12"))
 	})
 	http.ListenAndServe(":8080", nil)
 }

@@ -78,6 +78,9 @@ type nodeSlot struct {
 	end   int
 }
 
+//执行钩子函数
+type Hook func(cmd, res []byte, addr string)
+
 //客户端
 type client struct {
 	addr                string              //连接地址
@@ -94,6 +97,7 @@ type client struct {
 	mode                string              //模式
 	nodeSlots           map[string]nodeSlot //hash槽映射
 	lock                sync.Mutex          //锁
+	hooks               []Hook              //钩子函数
 }
 
 var (
@@ -160,6 +164,7 @@ func NewClient(option Option) (*client, error) {
 
 //创建cluster客户端
 func NewClusterClient(option Option) (*client, error) {
+
 	//处理数据
 	warpOption(&option)
 
@@ -228,6 +233,11 @@ func (c *client) Status() {
 	fmt.Println(strings.Repeat("*", 50))
 }
 
+//添加钩子函数
+func (c *client) AddHook(hook Hook) {
+	c.hooks = append(c.hooks, hook)
+}
+
 //ping命令
 func (c *client) Ping() (string, error) {
 	cmd := []byte(pingCmd)
@@ -251,9 +261,6 @@ func (c *client) Get(key string) (string, error) {
 		switch res.(type) {
 		case string:
 			v := res.(string)
-			if v == "-1" {
-				return "", ErrorKeyNotFound
-			}
 			return v, nil
 		case []string:
 			v := res.([]string)
@@ -331,16 +338,19 @@ func (c *client) Expire(key string, lifeTime time.Duration) (bool, error) {
 }
 
 //exists命令
-func (c *client) Exists(key string) (int, error) {
-	cmd := []byte(fmt.Sprintf("*%3\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key))
+func (c *client) Exists(key string) (bool, error) {
+	cmd := []byte(fmt.Sprintf("*2\r\n$6\r\nEXISTS\r\n$%d\r\n%s\r\n", len(key), key))
 	if res, err := c.sendCmd(key, cmd); err != nil {
-		return 0, err
+		return false, err
 	} else {
 		switch res.(type) {
 		case int:
-			return res.(int), nil
+			if res.(int) == 0 {
+				return false, nil
+			}
+			return true, nil
 		}
-		return 0, ErrorAssertion
+		return false, ErrorAssertion
 	}
 }
 
@@ -375,6 +385,79 @@ func (c *client) Decr(key string) (int, error) {
 //ttl命令
 func (c *client) TTL(key string) (int, error) {
 	cmd := []byte(fmt.Sprintf("*2\r\n$3\r\nTTL\r\n$%d\r\n%s\r\n", len(key), key))
+	if res, err := c.sendCmd(key, cmd); err != nil {
+		return 0, err
+	} else {
+		switch res.(type) {
+		case int:
+			return res.(int), nil
+		}
+		return 0, ErrorAssertion
+	}
+}
+
+//hset命令
+func (c *client) HSet(key, field, value string) (int, error) {
+	cmd := []byte(fmt.Sprintf("*4\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field, len(value), value))
+	if res, err := c.sendCmd(key, cmd); err != nil {
+		return 0, err
+	} else {
+		switch res.(type) {
+		case int:
+			return res.(int), nil
+		}
+		return 0, ErrorAssertion
+	}
+}
+
+//hget命令
+func (c *client) HGet(key, field string) (string, error) {
+	cmd := []byte(fmt.Sprintf("*3\r\n$4\r\nHGET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field))
+	if res, err := c.sendCmd(key, cmd); err != nil {
+		return "", err
+	} else {
+		switch res.(type) {
+		case string:
+			return res.(string), nil
+		}
+		return "", ErrorAssertion
+	}
+}
+
+//hdel命令
+func (c *client) HDel(key, field string) (int, error) {
+	cmd := []byte(fmt.Sprintf("*3\r\n$4\r\nHDEL\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field))
+	if res, err := c.sendCmd(key, cmd); err != nil {
+		return 0, err
+	} else {
+		switch res.(type) {
+		case int:
+			return res.(int), nil
+		}
+		return 0, ErrorAssertion
+	}
+}
+
+//hexists命令
+func (c *client) HExists(key, field string) (bool, error) {
+	cmd := []byte(fmt.Sprintf("*3\r\n$7\r\nHEXISTS\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(field), field))
+	if res, err := c.sendCmd(key, cmd); err != nil {
+		return false, err
+	} else {
+		switch res.(type) {
+		case int:
+			if res.(int) == 0 {
+				return false, nil
+			}
+			return true, nil
+		}
+		return false, ErrorAssertion
+	}
+}
+
+//hlen命令
+func (c *client) HLen(key string) (int, error) {
+	cmd := []byte(fmt.Sprintf("*2\r\n$4\r\nHLEN\r\n$%d\r\n%s\r\n", len(key), key))
 	if res, err := c.sendCmd(key, cmd); err != nil {
 		return 0, err
 	} else {
@@ -430,6 +513,13 @@ func (c *client) sendCmdByAssignConn(conn rConn, cmd []byte) (interface{}, error
 	//释放工作连接
 	go c.releaseWorkConn(conn)
 
+	//执行钩子函数
+	go func() {
+		for _, hook := range c.hooks {
+			hook(cmd, data, conn.addr)
+		}
+	}()
+
 	//解析数据
 	if v, err := c.parseResp(data); err != nil {
 		if err == ErrorMoved || err == ErrorAsk {
@@ -483,9 +573,6 @@ func (c *client) deleteWorkConn(conn rConn) {
 func (c *client) getRestConn(addr string) (rConn, error) {
 	c.rested.lock.Lock()
 	defer c.rested.lock.Unlock()
-	//fmt.Println("+++++++++++++++++++++++++++")
-	//fmt.Println(len(c.rested.pool[addr]), len(c.worker.pool[addr]), c.maxOpenConn)
-	//fmt.Println("+++++++++++++++++++++++++++")
 	if len(c.rested.pool[addr]) > 0 {
 		var restedConn rConn
 		for conn := range c.rested.pool[addr] {
@@ -493,7 +580,7 @@ func (c *client) getRestConn(addr string) (rConn, error) {
 			break
 		}
 		c.worker.lock.Lock()
-		if len(c.worker.pool[addr]) + len(c.rested.pool[addr]) <= c.maxOpenConn {
+		if len(c.worker.pool[addr])+len(c.rested.pool[addr]) <= c.maxOpenConn {
 			c.worker.pool[addr][restedConn] = struct{}{}
 			c.worker.lock.Unlock()
 			c.deleteRestConn(restedConn)
@@ -508,7 +595,7 @@ func (c *client) getRestConn(addr string) (rConn, error) {
 	//检查是否超出最大连接数
 	c.worker.lock.Lock()
 	defer c.worker.lock.Unlock()
-	if len(c.worker.pool[addr]) + len(c.rested.pool[addr]) < c.maxOpenConn {
+	if len(c.worker.pool[addr])+len(c.rested.pool[addr]) < c.maxOpenConn {
 		if netConn, err := createTcpConn(addr, c.connectTimeout); err != nil {
 			return rConn{}, err
 		} else {
@@ -659,9 +746,9 @@ func (c *client) parseResp(res []byte) (interface{}, error) {
 	case '$':
 		//批量回复
 		if res[1] == '-' {
-			return string(res[1 : length-2]), nil
+			return "", ErrorKeyNotFound
 		}
-		return strings.Split(string(res[1:length-2]), "\n"), nil
+		return strings.Split(string(res[1:length-2]), "\r\n")[1], nil
 	case '*':
 		//数组
 		s := strings.Split(string(res), "\r\n")
