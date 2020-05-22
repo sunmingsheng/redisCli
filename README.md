@@ -52,13 +52,26 @@ go func() {
 }()
 ```
 
-4:其他命令
+4:其他方法的使用
 ```golang
 fmt.Println(client.Get("age"))
 fmt.Println(client.HLen("12"))
 ```
-
-                             
- 
+                           
+5:目前支持的redis命令
++ ping
++ set
++ get
++ del
++ expire
++ ttl
++ exists
++ incr
++ decr
++ hset
++ hget
++ hdel
++ hlen
++ hexists
  
  
