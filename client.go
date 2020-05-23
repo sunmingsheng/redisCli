@@ -13,6 +13,7 @@ import (
 )
 
 const (
+	defaultDataBase            = "0"              //默认使用的库
 	defaultMaxOpenConn         = 3                //默认单机最大连接数
 	defaultMaxIdleConn         = 1                //默认单机最大空闲连接数
 	defaultMaxIdleTime         = 5 * time.Minute  //默认连接最大空闲时间
@@ -40,6 +41,7 @@ const (
 //redis 连接池的实现
 type Option struct {
 	Addr                string        //连接地址
+	DataBase            string        //库编号
 	Cluster             []string      //cluster集群配置
 	MaxOpenConn         int           //最大连接数
 	MaxIdleConn         int           //最大空闲数量
@@ -84,6 +86,7 @@ type Hook func(cmd, res []byte, addr string)
 //客户端
 type client struct {
 	addr                string              //连接地址
+	database            string              //库地址
 	cluster             []string            //地址
 	worker              worker              //工作连接池
 	idler               idler               //空闲连接池
@@ -108,6 +111,7 @@ var (
 	ErrorNoConnect          = errors.New("无可用连接")
 	ErrorMoved              = errors.New("key slot moved")
 	ErrorAsk                = errors.New("key slot ask")
+	ErrorSelectDb           = errors.New("切库失败")
 	ErrorSomeWrong          = errors.New("some wrong")
 )
 
@@ -139,6 +143,7 @@ func NewClient(option Option) (*client, error) {
 	//创建客户端对象
 	client := &client{
 		addr: option.Addr,
+		database: option.DataBase,
 		worker: worker{
 			pool: workerPool,
 			lock: sync.Mutex{},
@@ -567,7 +572,7 @@ func (c *client) deleteWorkConn(conn conn) {
 }
 
 //获取空闲连接
-func (c *client) getRestConn(addr string) (conn, error) {
+func (c *client) getIdleConn(addr, database string) (conn, error) {
 	c.idler.lock.Lock()
 	defer c.idler.lock.Unlock()
 	if len(c.idler.pool[addr]) > 0 {
@@ -580,11 +585,11 @@ func (c *client) getRestConn(addr string) (conn, error) {
 		if len(c.worker.pool[addr])+len(c.idler.pool[addr]) <= c.maxOpenConn {
 			c.worker.pool[addr][idleConn] = struct{}{}
 			c.worker.lock.Unlock()
-			c.deleteRestConn(idleConn)
+			c.deleteIdleConn(idleConn)
 			return idleConn, nil
 		} else {
 			c.worker.lock.Unlock()
-			c.closeRestConn(idleConn)
+			c.closeIdleConn(idleConn)
 			return conn{}, ErrorNoConnect
 		}
 	}
@@ -597,6 +602,22 @@ func (c *client) getRestConn(addr string) (conn, error) {
 			return conn{}, err
 		} else {
 			newConn := conn{netConn: netConn, addr: addr}
+			//单机模式,切库
+			if c.mode == singletonMode && database != "0" {
+				cmd := []byte(fmt.Sprintf("*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n", len(database), database))
+				if res, err := c.sendCmdByAssignConn(newConn, cmd); err != nil {
+					return conn{}, err
+				} else {
+					switch res.(type) {
+					case string:
+						if res.(string) != "OK" {
+							return conn{}, ErrorSelectDb
+						}
+					default:
+						return conn{}, ErrorAssertion
+					}
+				}
+			}
 			c.worker.pool[addr][newConn] = struct{}{}
 			return newConn, nil
 		}
@@ -605,20 +626,20 @@ func (c *client) getRestConn(addr string) (conn, error) {
 }
 
 //添加空闲连接
-func (c *client) addRestConn(conn conn) {
+func (c *client) addIdleConn(conn conn) {
 	c.idler.lock.Lock()
 	c.idler.pool[conn.addr][conn] = idleConn{idleTime: time.Now()}
 	c.idler.lock.Unlock()
 }
 
 //关闭空闲连接
-func (c *client) closeRestConn(conn conn) {
-	c.deleteRestConn(conn)
+func (c *client) closeIdleConn(conn conn) {
+	c.deleteIdleConn(conn)
 	conn.netConn.Close()
 }
 
 //删除空闲连接
-func (c *client) deleteRestConn(conn conn) {
+func (c *client) deleteIdleConn(conn conn) {
 	for addr, pool := range c.idler.pool {
 		for conn := range pool {
 			if conn == conn {
@@ -636,7 +657,7 @@ func (c *client) releaseWorkConn(conn conn) {
 
 	default:
 		c.deleteWorkConn(conn)
-		c.addRestConn(conn)
+		c.addIdleConn(conn)
 	}
 }
 
@@ -657,18 +678,18 @@ func healthCheck(c *client) {
 			connCount := len(pool)
 			for conn, idleConn := range pool {
 				if idleConn.idleTime.Add(c.maxIdleTime).Before(time.Now()) || connCount > c.maxIdleConn {
-					c.closeRestConn(conn)
+					c.closeIdleConn(conn)
 					continue
 				}
 				if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
 					connCount -= 1
-					c.closeRestConn(conn)
+					c.closeIdleConn(conn)
 				} else {
 					if v, ok := res.(string); ok && v == "PONG" {
 
 					} else {
 						connCount -= 1
-						c.closeRestConn(conn)
+						c.closeIdleConn(conn)
 					}
 				}
 			}
@@ -683,8 +704,8 @@ func (c *client) getClusterNodes(conn conn) error {
 		return err
 	} else {
 		switch res.(type) {
-		case []string:
-			nodes := res.([]string)
+		case string:
+			nodes := strings.Split(res.(string), "\n")
 			nodeSlots := make(map[string]nodeSlot)
 			for _, nodeInfo := range nodes {
 				info := strings.Split(nodeInfo, " ")
@@ -766,6 +787,9 @@ func (c *client) parseResp(res []byte) (interface{}, error) {
 
 //对数据进行包装
 func warpOption(option *Option) {
+	if option.DataBase == "" {
+		option.DataBase = defaultDataBase
+	}
 	if option.MaxIdleConn == 0 {
 		option.MaxIdleConn = defaultMaxIdleConn
 	}
@@ -821,7 +845,7 @@ func (c *client) getConn(key string) (conn, error) {
 		return conn, nil
 	default:
 		//获取新的连接
-		return c.getRestConn(addr)
+		return c.getIdleConn(addr, c.database)
 	}
 }
 
