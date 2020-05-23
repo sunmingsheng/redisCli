@@ -43,7 +43,7 @@ func main() {
 
 	http.HandleFunc("/redis", func(writer http.ResponseWriter, request *http.Request) {
 
-		fmt.Println(client.HLen("12"))
+		fmt.Println(client.Get("121"))
 	})
 	http.ListenAndServe(":8080", nil)
 }

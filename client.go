@@ -50,25 +50,25 @@ type Option struct {
 	HealthCheckDuration time.Duration //健康检查周期
 }
 
-type rConn struct {
+type conn struct {
 	netConn net.Conn
 	addr    string
 }
 
 //空闲连接对象
-type restedConn struct {
+type idleConn struct {
 	idleTime time.Time //空闲时间点
 }
 
 //空闲连接池
-type rested struct {
-	pool map[string]map[rConn]restedConn
+type idler struct {
+	pool map[string]map[conn]idleConn
 	lock sync.Mutex
 }
 
 //工作连接池
 type worker struct {
-	pool map[string]map[rConn]struct{}
+	pool map[string]map[conn]struct{}
 	lock sync.Mutex
 }
 
@@ -86,7 +86,7 @@ type client struct {
 	addr                string              //连接地址
 	cluster             []string            //地址
 	worker              worker              //工作连接池
-	rested              rested              //空闲连接池
+	idler               idler               //空闲连接池
 	maxOpenConn         int                 //最大连接数
 	maxIdleConn         int                 //最大空闲数量
 	maxIdleTime         time.Duration       //最长空闲时间
@@ -112,7 +112,7 @@ var (
 )
 
 //空闲连接channel
-var restedChan map[string]chan rConn
+var idlerChan map[string]chan conn
 
 //key属性
 type KeyOption struct {
@@ -121,7 +121,7 @@ type KeyOption struct {
 }
 
 func init() {
-	restedChan = make(map[string]chan rConn)
+	idlerChan = make(map[string]chan conn)
 }
 
 //创建客户端
@@ -131,10 +131,10 @@ func NewClient(option Option) (*client, error) {
 	warpOption(&option)
 
 	//初始化数据
-	workerPool := make(map[string]map[rConn]struct{})
-	workerPool[option.Addr] = make(map[rConn]struct{})
-	restedPool := make(map[string]map[rConn]restedConn)
-	restedPool[option.Addr] = make(map[rConn]restedConn)
+	workerPool := make(map[string]map[conn]struct{})
+	workerPool[option.Addr] = make(map[conn]struct{})
+	idlerPool := make(map[string]map[conn]idleConn)
+	idlerPool[option.Addr] = make(map[conn]idleConn)
 
 	//创建客户端对象
 	client := &client{
@@ -143,8 +143,8 @@ func NewClient(option Option) (*client, error) {
 			pool: workerPool,
 			lock: sync.Mutex{},
 		},
-		rested: rested{
-			pool: restedPool,
+		idler: idler{
+			pool: idlerPool,
 			lock: sync.Mutex{},
 		},
 		maxIdleConn:         option.MaxIdleConn,
@@ -169,12 +169,12 @@ func NewClusterClient(option Option) (*client, error) {
 	warpOption(&option)
 
 	//初始化数据
-	workerPool := make(map[string]map[rConn]struct{})
-	restedPool := make(map[string]map[rConn]restedConn)
+	workerPool := make(map[string]map[conn]struct{})
+	idlerPool := make(map[string]map[conn]idleConn)
 	for _, addr := range option.Cluster {
-		workerPool[addr] = make(map[rConn]struct{})
-		restedPool[addr] = make(map[rConn]restedConn)
-		restedChan[addr] = make(chan rConn)
+		workerPool[addr] = make(map[conn]struct{})
+		idlerPool[addr] = make(map[conn]idleConn)
+		idlerChan[addr] = make(chan conn)
 	}
 
 	//创建客户端对象
@@ -184,8 +184,8 @@ func NewClusterClient(option Option) (*client, error) {
 			pool: workerPool,
 			lock: sync.Mutex{},
 		},
-		rested: rested{
-			pool: restedPool,
+		idler: idler{
+			pool: idlerPool,
 			lock: sync.Mutex{},
 		},
 		maxIdleConn:         option.MaxIdleConn,
@@ -219,13 +219,13 @@ func (c *client) Status() {
 	if c.mode == singletonMode {
 		fmt.Println("连接地址:" + c.addr)
 		fmt.Println("工作连接数:", len(c.worker.pool[c.addr]))
-		fmt.Println("空闲连接数:", len(c.rested.pool[c.addr]))
+		fmt.Println("空闲连接数:", len(c.idler.pool[c.addr]))
 	}
 	if c.mode == clusterMode {
 		for _, addr := range c.cluster {
 			fmt.Println("连接地址:" + addr)
 			fmt.Println("工作连接数:", len(c.worker.pool[addr]))
-			fmt.Println("空闲连接数:", len(c.rested.pool[addr]))
+			fmt.Println("空闲连接数:", len(c.idler.pool[addr]))
 			fmt.Println(strings.Repeat("-", 50))
 		}
 	}
@@ -262,9 +262,6 @@ func (c *client) Get(key string) (string, error) {
 		case string:
 			v := res.(string)
 			return v, nil
-		case []string:
-			v := res.([]string)
-			return v[1], nil
 		}
 		return "", ErrorAssertion
 	}
@@ -470,7 +467,7 @@ func (c *client) HLen(key string) (int, error) {
 }
 
 //通过指定连接发送命令
-func (c *client) sendCmdByAssignConn(conn rConn, cmd []byte) (interface{}, error) {
+func (c *client) sendCmdByAssignConn(conn conn, cmd []byte) (interface{}, error) {
 
 	//设置tcp读超时
 	if err := conn.netConn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
@@ -557,75 +554,75 @@ func (c *client) sendCmd(key string, cmd []byte) (interface{}, error) {
 }
 
 //关闭工作连接
-func (c *client) closeWorkConn(conn rConn) {
+func (c *client) closeWorkConn(conn conn) {
 	c.deleteWorkConn(conn)
 	conn.netConn.Close()
 }
 
 //删除工作连接
-func (c *client) deleteWorkConn(conn rConn) {
+func (c *client) deleteWorkConn(conn conn) {
 	c.worker.lock.Lock()
 	delete(c.worker.pool[conn.addr], conn)
 	c.worker.lock.Unlock()
 }
 
 //获取空闲连接
-func (c *client) getRestConn(addr string) (rConn, error) {
-	c.rested.lock.Lock()
-	defer c.rested.lock.Unlock()
-	if len(c.rested.pool[addr]) > 0 {
-		var restedConn rConn
-		for conn := range c.rested.pool[addr] {
-			restedConn = conn
+func (c *client) getRestConn(addr string) (conn, error) {
+	c.idler.lock.Lock()
+	defer c.idler.lock.Unlock()
+	if len(c.idler.pool[addr]) > 0 {
+		var idleConn conn
+		for conn := range c.idler.pool[addr] {
+			idleConn = conn
 			break
 		}
 		c.worker.lock.Lock()
-		if len(c.worker.pool[addr])+len(c.rested.pool[addr]) <= c.maxOpenConn {
-			c.worker.pool[addr][restedConn] = struct{}{}
+		if len(c.worker.pool[addr])+len(c.idler.pool[addr]) <= c.maxOpenConn {
+			c.worker.pool[addr][idleConn] = struct{}{}
 			c.worker.lock.Unlock()
-			c.deleteRestConn(restedConn)
-			return restedConn, nil
+			c.deleteRestConn(idleConn)
+			return idleConn, nil
 		} else {
 			c.worker.lock.Unlock()
-			c.closeRestConn(restedConn)
-			return rConn{}, ErrorNoConnect
+			c.closeRestConn(idleConn)
+			return conn{}, ErrorNoConnect
 		}
 	}
 
 	//检查是否超出最大连接数
 	c.worker.lock.Lock()
 	defer c.worker.lock.Unlock()
-	if len(c.worker.pool[addr])+len(c.rested.pool[addr]) < c.maxOpenConn {
+	if len(c.worker.pool[addr])+len(c.idler.pool[addr]) < c.maxOpenConn {
 		if netConn, err := createTcpConn(addr, c.connectTimeout); err != nil {
-			return rConn{}, err
+			return conn{}, err
 		} else {
-			newConn := rConn{netConn: netConn, addr: addr}
+			newConn := conn{netConn: netConn, addr: addr}
 			c.worker.pool[addr][newConn] = struct{}{}
 			return newConn, nil
 		}
 	}
-	return rConn{}, ErrorNoConnect
+	return conn{}, ErrorNoConnect
 }
 
 //添加空闲连接
-func (c *client) addRestConn(conn rConn) {
-	c.rested.lock.Lock()
-	c.rested.pool[conn.addr][conn] = restedConn{idleTime: time.Now()}
-	c.rested.lock.Unlock()
+func (c *client) addRestConn(conn conn) {
+	c.idler.lock.Lock()
+	c.idler.pool[conn.addr][conn] = idleConn{idleTime: time.Now()}
+	c.idler.lock.Unlock()
 }
 
 //关闭空闲连接
-func (c *client) closeRestConn(conn rConn) {
+func (c *client) closeRestConn(conn conn) {
 	c.deleteRestConn(conn)
 	conn.netConn.Close()
 }
 
 //删除空闲连接
-func (c *client) deleteRestConn(conn rConn) {
-	for addr, pool := range c.rested.pool {
-		for rConn := range pool {
-			if rConn == conn {
-				delete(c.rested.pool[addr], rConn)
+func (c *client) deleteRestConn(conn conn) {
+	for addr, pool := range c.idler.pool {
+		for conn := range pool {
+			if conn == conn {
+				delete(c.idler.pool[addr], conn)
 				break
 			}
 		}
@@ -633,9 +630,9 @@ func (c *client) deleteRestConn(conn rConn) {
 }
 
 //释放工作连接
-func (c *client) releaseWorkConn(conn rConn) {
+func (c *client) releaseWorkConn(conn conn) {
 	select {
-	case restedChan[conn.addr] <- conn:
+	case idlerChan[conn.addr] <- conn:
 
 	default:
 		c.deleteWorkConn(conn)
@@ -656,22 +653,22 @@ func healthCheck(c *client) {
 			}
 		}
 
-		for _, pool := range c.rested.pool {
+		for _, pool := range c.idler.pool {
 			connCount := len(pool)
-			for rConn, restedConn := range pool {
-				if restedConn.idleTime.Add(c.maxIdleTime).Before(time.Now()) || connCount > c.maxIdleConn {
-					c.closeRestConn(rConn)
+			for conn, idleConn := range pool {
+				if idleConn.idleTime.Add(c.maxIdleTime).Before(time.Now()) || connCount > c.maxIdleConn {
+					c.closeRestConn(conn)
 					continue
 				}
-				if res, err := c.sendCmdByAssignConn(rConn, cmd); err != nil {
+				if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
 					connCount -= 1
-					c.closeRestConn(rConn)
+					c.closeRestConn(conn)
 				} else {
 					if v, ok := res.(string); ok && v == "PONG" {
 
 					} else {
 						connCount -= 1
-						c.closeRestConn(rConn)
+						c.closeRestConn(conn)
 					}
 				}
 			}
@@ -680,7 +677,7 @@ func healthCheck(c *client) {
 }
 
 //发送cluster nodes命令
-func (c *client) getClusterNodes(conn rConn) error {
+func (c *client) getClusterNodes(conn conn) error {
 	cmd := []byte(clusterNodeCmd)
 	if res, err := c.sendCmdByAssignConn(conn, cmd); err != nil {
 		return err
@@ -756,7 +753,7 @@ func (c *client) parseResp(res []byte) (interface{}, error) {
 		for i := 1; i < len(s); i++ {
 			if i%2 == 1 && len(s[i]) > 0 && s[i][0] == '$' {
 				if (s[i][1:]) == "-1" {
-					res = append(res, "-1")
+					res = append(res, "")
 				} else {
 					res = append(res, s[i+1])
 				}
@@ -798,7 +795,7 @@ func createTcpConn(addr string, timeout time.Duration) (net.Conn, error) {
 }
 
 //获取tcp连接
-func (c *client) getConn(key string) (rConn, error) {
+func (c *client) getConn(key string) (conn, error) {
 	addr := ""
 	if c.mode == clusterMode {
 		if key != "" || (key == "" && len(c.nodeSlots) > 0) {
@@ -820,7 +817,7 @@ func (c *client) getConn(key string) (rConn, error) {
 		addr = c.addr
 	}
 	select {
-	case conn := <-restedChan[addr]:
+	case conn := <-idlerChan[addr]:
 		return conn, nil
 	default:
 		//获取新的连接
