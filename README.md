@@ -8,6 +8,7 @@ redisCli是一个 golang redis 客户端，支持单点redis以及cluster模式�
    ```golang
     options := redisCli.Option{
 		    Addr:"127.0.0.1:6379",
+		    DataBase: "12",
 		    MaxIdleTime: time.Second * 1000,
 		    MaxOpenConn: 30,
 		    MaxIdleConn: 2,
