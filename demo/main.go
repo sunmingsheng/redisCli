@@ -24,7 +24,7 @@ func main() {
 		MaxIdleConn: 2,
 		DataBase: "1",
 	}
-	client, err := redisCli.NewClusterClient(options)
+	client, err := redisCli.NewClient(options)
 	if err != nil {
 		fmt.Println(err)
 	}
